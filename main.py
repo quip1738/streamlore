@@ -1,7 +1,9 @@
 
 import os
+import secrets
+import httpx
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 
 app = FastAPI(
@@ -154,5 +156,54 @@ async def health():
         "freellmapi_configured": bool(
             os.getenv("FREELLMAPI_URL")
             and os.getenv("FREELLMAPI_API_KEY")
+@app.post("/api/test-ai")
+async def test_ai(x_test_token: str = Header(default="")):
+    expected_token = os.getenv("STREAMLORE_TEST_TOKEN", "")
+
+    if not expected_token or not secrets.compare_digest(
+        x_test_token, expected_token
+    ):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    base_url = os.getenv("FREELLMAPI_URL", "").rstrip("/")
+    api_key = os.getenv("FREELLMAPI_API_KEY", "")
+
+    if not base_url or not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="FreeLLMAPI configuration missing"
+        )
+
+    payload = {
+        "model": "auto",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Reply with exactly: STREAMLORE AI TEST SUCCESS"
+            }
+        ],
+        "stream": False
+    }
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            f"{base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"FreeLLMAPI error: {response.text[:500]}"
+        )
+
+    result = response.json()
+
+    return {
+        "status": "success",
+        "model": result.get("model"),
+        "response": result["choices"][0]["message"]["content"]
+    }
         ),
     }
