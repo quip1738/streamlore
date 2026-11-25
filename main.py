@@ -1,8 +1,10 @@
 
 import os
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 app = FastAPI(
     title="StreamLore API",
@@ -12,27 +14,24 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://streamlore.prod.page",
-    ],
+    allow_origins=["https://streamlore.prod.page"],
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "Authorization"],
 )
 
+BASE_DIR = Path(__file__).resolve().parent
+
 
 @app.get("/")
 async def home():
-    return {
-        "app": "StreamLore",
-        "status": "online",
-        "purpose": "GTA VI AI clipping platform",
-    }
+    return FileResponse(BASE_DIR / "index.html")
 
 
-@app.get("/health")
+@app.get("/api/health")
 async def health():
     return {
+        "app": "StreamLore",
         "status": "healthy",
         "freellmapi_configured": bool(
             os.getenv("FREELLMAPI_URL")
