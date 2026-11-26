@@ -8,6 +8,10 @@ on:
         description: "Twitch, YouTube, or Kick VOD URL"
         required: true
         type: string
+      job_id:
+        description: "Supabase job ID"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -44,16 +48,19 @@ jobs:
       - name: Process VOD
         env:
           VOD_URL: ${{ inputs.video_url }}
+          JOB_ID: ${{ inputs.job_id }}
           STREAMLORE_API_URL: https://streamlore.prod.page
           STREAMLORE_INTERNAL_TOKEN: ${{ secrets.STREAMLORE_INTERNAL_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           python worker/process_vod.py
 
-      - name: Upload generated clip
+      - name: Upload generated clip artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: streamlore-clip-${{ github.run_id }}
+          name: streamlore-clip-${{ inputs.job_id }}
           path: output/streamlore-vertical.mp4
           if-no-files-found: error
           retention-days: 1
