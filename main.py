@@ -1,8 +1,9 @@
-
 import os
 import json
 import base64
 import secrets
+import logging
+import uuid
 import httpx
 
 from urllib.parse import urlparse, quote
@@ -12,7 +13,10 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 
-app = FastAPI(title="StreamLore", version="0.6.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("streamlore")
+
+app = FastAPI(title="StreamLore", version="0.7.0")
 
 
 # --------------------------------------------------
@@ -36,8 +40,8 @@ GITHUB_TOKEN = os.getenv("STREAMLORE_GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("STREAMLORE_GITHUB_REPO", "")
 ACCESS_CODE = os.getenv("STREAMLORE_ACCESS_CODE", "")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 BUCKET = "streamlore-clips"
 
@@ -59,6 +63,39 @@ class JobStatusRequest(BaseModel):
 class FrameRequest(BaseModel):
     image_base64: str
     mime_type: str = "image/jpeg"
+
+
+# --------------------------------------------------
+# ERROR HELPERS
+# --------------------------------------------------
+
+def describe_error(exc):
+    """Turn an exception into a short, readable summary for logs and the UI."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        message = ""
+
+        try:
+            body = exc.response.json()
+            if isinstance(body, dict):
+                message = (
+                    body.get("message")
+                    or body.get("error_description")
+                    or body.get("error")
+                    or ""
+                )
+            else:
+                message = str(body)
+        except Exception:
+            message = exc.response.text
+
+        message = str(message).strip().replace("\n", " ")[:200]
+        return f"HTTP {status}: {message}" if message else f"HTTP {status}"
+
+    text = str(exc).strip()
+    name = type(exc).__name__
+
+    return f"{name}: {text}" if text else name
 
 
 # --------------------------------------------------
@@ -93,6 +130,24 @@ async def update_job(job_id, values):
     response.raise_for_status()
 
 
+async def mark_job_failed(job_id, message):
+    """Best effort: record a failure without hiding the original error."""
+    try:
+        await update_job(
+            job_id,
+            {
+                "status": "failed",
+                "error_message": message,
+            },
+        )
+    except Exception as exc:
+        logger.error(
+            "Could not mark job %s as failed: %s",
+            job_id,
+            describe_error(exc),
+        )
+
+
 async def get_job(job_id):
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.get(
@@ -121,8 +176,8 @@ async def create_clip_link(storage_path):
     if not storage_path:
         return None
 
-    # Only allow paths belonging to this application's bucket.
-    if not storage_path.startswith(""):
+    # Reject absolute paths and path traversal.
+    if storage_path.startswith("/") or ".." in storage_path.split("/"):
         raise RuntimeError("Invalid clip storage path.")
 
     encoded_path = quote(storage_path, safe="/")
@@ -176,7 +231,7 @@ async def health():
     return {
         "status": "ok",
         "service": "StreamLore",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "github_configured": bool(GITHUB_TOKEN and GITHUB_REPO),
         "vision_configured": bool(FREELLMAPI_KEY and VISION_MODEL),
         "internal_token_configured": bool(INTERNAL_TOKEN),
@@ -400,6 +455,21 @@ function showError(text) {
     message.className = "error";
 }
 
+// Reads the response safely, even if the server (or a proxy)
+// returns an HTML error page instead of JSON.
+async function readJson(response) {
+    const text = await response.text();
+
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        return {
+            detail: "Server error (" + response.status + "). " +
+                    "Please try again in a moment."
+        };
+    }
+}
+
 async function checkJob(jobId, accessCode) {
     const response = await fetch("/api/jobs/status", {
         method: "POST",
@@ -412,7 +482,7 @@ async function checkJob(jobId, accessCode) {
         })
     });
 
-    const data = await response.json();
+    const data = await readJson(response);
 
     if (!response.ok) {
         throw new Error(data.detail || "Could not retrieve job status.");
@@ -511,7 +581,7 @@ form.addEventListener("submit", async (event) => {
             })
         });
 
-        const data = await response.json();
+        const data = await readJson(response);
 
         if (!response.ok) {
             throw new Error(data.detail || "Unable to submit job.");
@@ -602,10 +672,13 @@ async def create_job(request: JobRequest):
 
         job_id = rows[0]["id"]
 
-    except Exception:
+    except Exception as exc:
+        summary = describe_error(exc)
+        logger.error("Supabase insert failed: %s", summary)
+
         raise HTTPException(
-            status_code=502,
-            detail="Could not create the job in Supabase.",
+            status_code=500,
+            detail=f"Could not create the job in Supabase ({summary}).",
         )
 
     # Dispatch GitHub Actions workflow.
@@ -637,34 +710,42 @@ async def create_job(request: JobRequest):
             )
 
         if response.status_code != 204:
-            await update_job(
+            github_text = response.text[:200].replace("\n", " ")
+
+            logger.error(
+                "GitHub dispatch failed: HTTP %s %s",
+                response.status_code,
+                github_text,
+            )
+
+            await mark_job_failed(
                 job_id,
-                {
-                    "status": "failed",
-                    "error_message": "GitHub could not start the worker.",
-                },
+                "GitHub could not start the worker.",
             )
 
             raise HTTPException(
-                status_code=502,
-                detail="GitHub could not start the cloud worker.",
+                status_code=500,
+                detail=(
+                    "GitHub could not start the cloud worker "
+                    f"(HTTP {response.status_code}: {github_text})."
+                ),
             )
 
     except HTTPException:
         raise
 
-    except Exception:
-        await update_job(
+    except Exception as exc:
+        summary = describe_error(exc)
+        logger.error("GitHub dispatch error: %s", summary)
+
+        await mark_job_failed(
             job_id,
-            {
-                "status": "failed",
-                "error_message": "Could not dispatch the cloud worker.",
-            },
+            "Could not dispatch the cloud worker.",
         )
 
         raise HTTPException(
-            status_code=502,
-            detail="Could not dispatch the cloud worker.",
+            status_code=500,
+            detail=f"Could not dispatch the cloud worker ({summary}).",
         )
 
     return {
@@ -693,13 +774,25 @@ async def job_status(request: JobStatusRequest):
             detail="Supabase is not configured.",
         )
 
+    # Job IDs are UUIDs; reject anything else early.
+    try:
+        uuid.UUID(request.job_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid job ID.",
+        )
+
     try:
         job = await get_job(request.job_id)
 
-    except Exception:
+    except Exception as exc:
+        summary = describe_error(exc)
+        logger.error("Supabase job lookup failed: %s", summary)
+
         raise HTTPException(
-            status_code=502,
-            detail="Could not retrieve job status.",
+            status_code=500,
+            detail=f"Could not retrieve job status ({summary}).",
         )
 
     if not job:
@@ -722,7 +815,11 @@ async def job_status(request: JobStatusRequest):
         try:
             clip_url = await create_clip_link(job["clip_path"])
 
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "Could not create clip link: %s",
+                describe_error(exc),
+            )
             clip_url = None
 
     return {
@@ -866,14 +963,28 @@ Rules:
         ],
     }
 
-    async with httpx.AsyncClient(timeout=90) as client:
-        response = await client.post(
-            api_url,
-            headers=headers,
-            json=payload,
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            response = await client.post(
+                api_url,
+                headers=headers,
+                json=payload,
+            )
+    except Exception as exc:
+        logger.error("Vision provider unreachable: %s", describe_error(exc))
+
+        raise HTTPException(
+            status_code=502,
+            detail="Vision provider could not be reached.",
         )
 
     if response.status_code != 200:
+        logger.error(
+            "Vision provider error: HTTP %s %s",
+            response.status_code,
+            response.text[:200].replace("\n", " "),
+        )
+
         raise HTTPException(
             status_code=502,
             detail="Vision provider returned an error.",
@@ -898,7 +1009,12 @@ Rules:
 
         parsed_result = json.loads(content)
 
-    except Exception:
+    except Exception as exc:
+        logger.error(
+            "Vision provider returned invalid JSON: %s",
+            describe_error(exc),
+        )
+
         raise HTTPException(
             status_code=502,
             detail="Vision provider returned invalid JSON.",
