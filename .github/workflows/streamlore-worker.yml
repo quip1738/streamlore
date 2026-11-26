@@ -11,13 +11,13 @@ on:
 
 jobs:
   inspect-vod:
-    name: Inspect GTA VI VOD
+    name: Inspect and Download GTA VI VOD
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Install Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -52,3 +52,23 @@ jobs:
           print("Uploader:", vod.get("uploader"))
           print("Platform:", vod.get("extractor"))
           PY
+
+      - name: Download 60-second sample
+        env:
+          VOD_URL: ${{ inputs.video_url }}
+        run: |
+          yt-dlp \
+            --download-sections "*0-60" \
+            --force-keyframes-at-cuts \
+            -f "best[ext=mp4]/best" \
+            --merge-output-format mp4 \
+            -o "streamlore-test.%(ext)s" \
+            "$VOD_URL"
+
+      - name: Upload test video
+        uses: actions/upload-artifact@v4
+        with:
+          name: streamlore-twitch-test
+          path: streamlore-test.mp4
+          if-no-files-found: error
+          retention-days: 1
