@@ -5,25 +5,33 @@ import json
 import base64
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
 
-API_URL = os.environ["STREAMLORE_API_URL"].rstrip("/")
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+API_URL = os.getenv(
+    "STREAMLORE_API_URL",
+    "https://streamlore.prod.page"
+).rstrip("/")
+
 INTERNAL_TOKEN = os.environ["STREAMLORE_INTERNAL_TOKEN"]
 VOD_URL = os.environ["VOD_URL"]
+JOB_ID = os.environ["JOB_ID"]
 
-WORK = Path("work")
-OUTPUT = Path("output")
+SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-WORK.mkdir(exist_ok=True)
-OUTPUT.mkdir(exist_ok=True)
+BUCKET = "streamlore-clips"
 
-# Scan the first 20 minutes by default.
-# These can be changed later through GitHub Actions environment variables.
 SCAN_DURATION_SECONDS = int(
     os.getenv("STREAMLORE_SCAN_SECONDS", "1200")
 )
+
 SAMPLE_INTERVAL_SECONDS = int(
     os.getenv("STREAMLORE_SAMPLE_INTERVAL", "45")
 )
@@ -31,21 +39,86 @@ SAMPLE_INTERVAL_SECONDS = int(
 CLIP_LENGTH = 30
 MIN_HIGHLIGHT_SCORE = 5
 MIN_FACECAM_CONFIDENCE = 0.70
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+WORK_DIR = Path("work")
+OUTPUT_DIR = Path("output")
+
+SOURCE_FILE = WORK_DIR / "source.mp4"
+OUTPUT_FILE = OUTPUT_DIR / "streamlore-vertical.mp4"
 
 
-def run(command, timeout=1200):
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+
+def run(command):
     subprocess.run(
         command,
         check=True,
-        timeout=timeout,
+        text=True
     )
+
+
+def supabase_headers(content_type="application/json"):
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": content_type,
+    }
+
+
+def update_job(values):
+    url = f"{SUPABASE_URL}/rest/v1/jobs"
+
+    response = httpx.patch(
+        url,
+        params={"id": f"eq.{JOB_ID}"},
+        headers={
+            **supabase_headers(),
+            "Prefer": "return=minimal",
+        },
+        json=values,
+        timeout=30,
+    )
+
+    response.raise_for_status()
+
+
+def upload_clip():
+    size = OUTPUT_FILE.stat().st_size
+
+    if size > MAX_UPLOAD_BYTES:
+        raise RuntimeError(
+            f"Generated clip is {size / 1024 / 1024:.1f} MB. "
+            "The configured upload limit is 50 MB."
+        )
+
+    storage_path = f"{JOB_ID}/streamlore-vertical.mp4"
+
+    encoded_path = quote(storage_path, safe="/")
+    url = (
+        f"{SUPABASE_URL}/storage/v1/object/"
+        f"{BUCKET}/{encoded_path}"
+    )
+
+    with OUTPUT_FILE.open("rb") as clip:
+        response = httpx.post(
+            url,
+            headers={
+                **supabase_headers("video/mp4"),
+                "x-upsert": "true",
+            },
+            content=clip,
+            timeout=300,
+        )
+
+    response.raise_for_status()
+    return storage_path
 
 
 def download_vod():
-    print(
-        f"Downloading the first "
-        f"{SCAN_DURATION_SECONDS // 60} minutes of the VOD..."
-    )
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
 
     run([
         "yt-dlp",
@@ -53,77 +126,51 @@ def download_vod():
         "--download-sections",
         f"*0-{SCAN_DURATION_SECONDS}",
         "--force-keyframes-at-cuts",
-        "-f",
-        "best[ext=mp4]/best",
         "--merge-output-format",
         "mp4",
+        "-f",
+        "best[height<=720][ext=mp4]/best[height<=720]/best",
         "-o",
-        str(WORK / "source.%(ext)s"),
+        str(SOURCE_FILE),
         VOD_URL,
     ])
 
-    candidates = sorted(
-        WORK.glob("source.*"),
-        key=lambda item: item.stat().st_mtime,
-        reverse=True,
-    )
+    if not SOURCE_FILE.exists():
+        raise RuntimeError("VOD download did not produce a video file.")
 
-    if not candidates:
-        raise RuntimeError("VOD download produced no video.")
-
-    return candidates[0]
+    if SOURCE_FILE.stat().st_size == 0:
+        raise RuntimeError("Downloaded video is empty.")
 
 
-def extract_frame(video, timestamp, output_path):
+# --------------------------------------------------
+# FRAME ANALYSIS
+# --------------------------------------------------
+
+def extract_frame(timestamp, destination):
     run([
         "ffmpeg",
         "-y",
         "-ss",
         str(timestamp),
         "-i",
-        str(video),
+        str(SOURCE_FILE),
         "-frames:v",
         "1",
         "-q:v",
-        "4",
-        str(output_path),
+        "3",
+        str(destination),
     ])
 
-    if not output_path.exists() or output_path.stat().st_size == 0:
+    if not destination.exists():
         raise RuntimeError(
-            f"Could not extract frame at {timestamp}s."
+            f"Could not extract frame at {timestamp} seconds."
         )
 
-    return output_path
 
-
-def parse_model_json(content):
-    if isinstance(content, list):
-        content = " ".join(
-            item.get("text", "")
-            for item in content
-            if isinstance(item, dict)
-        )
-
-    if not isinstance(content, str):
-        raise RuntimeError(
-            "Vision model returned an unexpected response."
-        )
-
-    match = re.search(r"\{.*\}", content, re.DOTALL)
-
-    if not match:
-        raise RuntimeError(
-            "Vision model did not return valid JSON."
-        )
-
-    return json.loads(match.group(0))
-
-
-def analyze_frame(frame):
-    encoded = base64.b64encode(
-        frame.read_bytes()
-    ).decode("ascii")
+def analyze_frame(frame_path, timestamp):
+    image_data = base64.b64encode(
+        frame_path.read_bytes()
+    ).decode("utf-8")
 
     response = httpx.post(
         f"{API_URL}/api/internal/analyze-frame",
@@ -131,371 +178,330 @@ def analyze_frame(frame):
             "X-Internal-Token": INTERNAL_TOKEN,
         },
         json={
-            "image_base64": encoded,
+            "image_base64": image_data,
             "mime_type": "image/jpeg",
         },
-        timeout=150,
+        timeout=120,
     )
 
     response.raise_for_status()
 
     result = response.json()
+    raw_analysis = result.get("analysis", "")
 
-    if result.get("status") != "success":
-        raise RuntimeError(
-            "Vision API did not return a successful analysis."
-        )
+    if isinstance(raw_analysis, dict):
+        analysis = raw_analysis
+    else:
+        text = str(raw_analysis).strip()
+        text = re.sub(r"^```(?:json)?", "", text)
+        text = re.sub(r"```$", "", text).strip()
 
-    return parse_model_json(result.get("analysis", ""))
+        try:
+            analysis = json.loads(text)
+        except json.JSONDecodeError:
+            print(f"Could not parse analysis at {timestamp}s")
+            return None
+
+    if not isinstance(analysis, dict):
+        return None
+
+    analysis["timestamp"] = timestamp
+    return analysis
 
 
-def rank_highlights(video):
-    print("Scanning GTA VI footage for exciting moments...")
-
-    sample_times = list(
-        range(
-            30,
-            SCAN_DURATION_SECONDS - 29,
-            SAMPLE_INTERVAL_SECONDS,
-        )
-    )
-
-    if not sample_times:
-        raise RuntimeError(
-            "Scan duration is too short to analyze."
-        )
+def scan_vod():
+    frame_dir = WORK_DIR / "frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
 
     candidates = []
 
-    prompt_description = """
-The vision API analyzes each frame for both highlight potential
-and facecam detection. The returned JSON is evaluated by this worker.
-"""
-
-    print(
-        f"Scanning {len(sample_times)} frames across "
-        f"{SCAN_DURATION_SECONDS // 60} minutes."
+    timestamps = range(
+        SAMPLE_INTERVAL_SECONDS,
+        SCAN_DURATION_SECONDS,
+        SAMPLE_INTERVAL_SECONDS,
     )
 
-    for index, timestamp in enumerate(sample_times, start=1):
-        frame = WORK / f"sample_{timestamp}.jpg"
+    for timestamp in timestamps:
+        frame_path = frame_dir / f"frame_{timestamp}.jpg"
+
+        print(f"Analyzing VOD at {timestamp}s")
 
         try:
-            extract_frame(video, timestamp, frame)
+            extract_frame(timestamp, frame_path)
+            result = analyze_frame(frame_path, timestamp)
 
-            result = analyze_frame(frame)
+            if result:
+                candidates.append(result)
 
-            score = int(result.get("highlight_score", 0))
-            score = max(0, min(10, score))
-
-            confidence = float(
-                result.get("facecam_confidence", 0)
-            )
-
-            candidate = {
-                "timestamp": timestamp,
-                "score": score,
-                "reason": str(result.get("reason", "")),
-                "facecam_detected": (
-                    result.get("facecam_detected") is True
-                ),
-                "facecam_box": result.get("facecam_box"),
-                "facecam_confidence": confidence,
-            }
-
-            candidates.append(candidate)
-
+        except Exception as exc:
             print(
-                f"[{index}/{len(sample_times)}] "
-                f"{timestamp}s: score {score}/10 - "
-                f"{candidate['reason']}"
-            )
-
-        except Exception as error:
-            print(
-                f"Could not analyze frame at "
-                f"{timestamp}s: {error}"
+                f"Skipping frame at {timestamp}s: "
+                f"{str(exc)[:300]}"
             )
 
     if not candidates:
         raise RuntimeError(
-            "No VOD frames could be analyzed."
+            "No usable frame analyses were returned."
         )
 
-    candidates.sort(
-        key=lambda item: item["score"],
-        reverse=True,
+    return candidates
+
+
+# --------------------------------------------------
+# HIGHLIGHT SELECTION
+# --------------------------------------------------
+
+def select_highlight(candidates):
+    valid = []
+
+    for item in candidates:
+        try:
+            score = float(item.get("highlight_score", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if score < MIN_HIGHLIGHT_SCORE:
+            continue
+
+        facecam = item.get("facecam_detected", False)
+
+        if facecam is not True:
+            continue
+
+        try:
+            confidence = float(
+                item.get("facecam_confidence", 0)
+            )
+        except (TypeError, ValueError):
+            continue
+
+        if confidence < MIN_FACECAM_CONFIDENCE:
+            continue
+
+        bbox = item.get("facecam_bbox")
+
+        if not isinstance(bbox, dict):
+            continue
+
+        try:
+            x = float(bbox["x"])
+            y = float(bbox["y"])
+            width = float(bbox["width"])
+            height = float(bbox["height"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        if not (
+            0 <= x < 1
+            and 0 <= y < 1
+            and 0 < width <= 1
+            and 0 < height <= 1
+            and x + width <= 1
+            and y + height <= 1
+        ):
+            continue
+
+        item["_score"] = score
+        item["_bbox"] = {
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+        }
+
+        valid.append(item)
+
+    if not valid:
+        raise RuntimeError(
+            "No highlight met the score and facecam "
+            "detection requirements."
+        )
+
+    valid.sort(
+        key=lambda item: item["_score"],
+        reverse=True
     )
 
-    print("Top highlight candidates:")
-    print(json.dumps(candidates[:5], indent=2))
-
-    best = candidates[0]
-
-    if best["score"] < MIN_HIGHLIGHT_SCORE:
-        raise RuntimeError(
-            "No sufficiently exciting highlight was found "
-            "in the scanned VOD section."
-        )
-
-    return best
+    return valid[0]
 
 
-def validate_facecam(candidate):
-    if not candidate["facecam_detected"]:
-        raise RuntimeError(
-            "No streamer facecam was detected. "
-            "Refusing to publish a badly composed clip."
-        )
+# --------------------------------------------------
+# VERTICAL VIDEO COMPOSITION
+# --------------------------------------------------
 
-    if (
-        candidate["facecam_confidence"]
-        < MIN_FACECAM_CONFIDENCE
-    ):
-        raise RuntimeError(
-            "Facecam confidence is too low."
-        )
+def render_vertical(highlight):
+    timestamp = int(highlight["timestamp"])
+    bbox = highlight["_bbox"]
 
-    box = candidate["facecam_box"]
+    start = max(0, timestamp - CLIP_LENGTH // 2)
 
-    if not isinstance(box, dict):
-        raise RuntimeError(
-            "Facecam bounding box is missing."
-        )
+    x = bbox["x"]
+    y = bbox["y"]
+    width = bbox["width"]
+    height = bbox["height"]
 
-    try:
-        x = float(box["x"])
-        y = float(box["y"])
-        width = float(box["width"])
-        height = float(box["height"])
-    except (KeyError, TypeError, ValueError):
-        raise RuntimeError(
-            "Invalid facecam coordinates."
-        )
-
-    if (
-        x < 0
-        or y < 0
-        or width <= 0
-        or height <= 0
-        or x + width > 1
-        or y + height > 1
-    ):
-        raise RuntimeError(
-            "Facecam coordinates are outside the frame."
-        )
-
-    return {
-        "x": x,
-        "y": y,
-        "width": width,
-        "height": height,
-    }
-
-
-def inspect_video(video):
-    result = subprocess.run(
+    # Convert normalized facecam coordinates to pixels.
+    probe = subprocess.run(
         [
             "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "json",
-            str(video),
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "json",
+            str(SOURCE_FILE),
         ],
         capture_output=True,
         text=True,
         check=True,
     )
 
-    streams = json.loads(
-        result.stdout
-    ).get("streams", [])
+    dimensions = json.loads(probe.stdout)["streams"][0]
 
-    if not streams:
-        raise RuntimeError(
-            "Could not read source video dimensions."
-        )
+    video_width = int(dimensions["width"])
+    video_height = int(dimensions["height"])
 
-    return (
-        int(streams[0]["width"]),
-        int(streams[0]["height"]),
-    )
-
-
-def even(value):
-    return max(2, int(value) // 2 * 2)
-
-
-def render_vertical(video, candidate):
-    facecam = validate_facecam(candidate)
-
-    source_width, source_height = inspect_video(video)
-
-    cam_x = even(facecam["x"] * source_width)
-    cam_y = even(facecam["y"] * source_height)
-    cam_w = even(facecam["width"] * source_width)
-    cam_h = even(facecam["height"] * source_height)
-
-    cam_w = min(cam_w, source_width - cam_x)
-    cam_h = min(cam_h, source_height - cam_y)
+    cam_x = int(x * video_width)
+    cam_y = int(y * video_height)
+    cam_w = int(width * video_width)
+    cam_h = int(height * video_height)
 
     if cam_w < 80 or cam_h < 60:
         raise RuntimeError(
-            "Detected facecam is too small."
+            "Detected facecam region is too small."
         )
 
-    # A 1080x960 gameplay panel needs a 9:8 source crop.
-    game_crop_w = even(source_height * 9 / 8)
+    # The gameplay crop must not include the detected facecam.
+    # This uses the opposite side of the facecam where possible.
+    candidates = [
+        (0, 0, cam_x),
+        (cam_x + cam_w, 0, video_width - (cam_x + cam_w)),
+    ]
 
-    if game_crop_w > source_width:
-        game_crop_h = even(source_width * 8 / 9)
-        game_crop_w = source_width
-        game_y = even(
-            (source_height - game_crop_h) / 2
-        )
-        possible_x = [0]
-    else:
-        game_crop_h = source_height
-        game_y = 0
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[2] >= video_width * 0.35
+    ]
 
-        possible_x = [
-            0,
-            even((source_width - game_crop_w) / 2),
-            even(source_width - game_crop_w),
-        ]
-
-    # Find a gameplay crop that avoids the facecam overlay.
-    cam_right = cam_x + cam_w
-    cam_bottom = cam_y + cam_h
-
-    choices = []
-
-    for game_x in possible_x:
-        game_right = game_x + game_crop_w
-        game_bottom = game_y + game_crop_h
-
-        overlap_x = max(
-            0,
-            min(cam_right, game_right)
-            - max(cam_x, game_x),
-        )
-
-        overlap_y = max(
-            0,
-            min(cam_bottom, game_bottom)
-            - max(cam_y, game_y),
-        )
-
-        overlap = (
-            overlap_x * overlap_y
-        ) / (cam_w * cam_h)
-
-        choices.append((overlap, game_x))
-
-    overlap, game_x = min(choices)
-
-    if overlap > 0.05:
+    if not candidates:
         raise RuntimeError(
             "Could not find a gameplay crop that avoids "
-            "the facecam. This stream needs a different "
-            "composition strategy."
+            "the detected facecam."
         )
 
-    start = max(
-        0,
-        candidate["timestamp"] - CLIP_LENGTH // 2,
+    crop_x, _, crop_w = max(
+        candidates,
+        key=lambda item: item[2]
     )
 
-    output = OUTPUT / "streamlore-vertical.mp4"
-
-    filter_graph = (
-        f"[0:v]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},"
-        "scale=1080:960:force_original_aspect_ratio=increase,"
-        "crop=1080:960[cam];"
-        f"[0:v]crop={game_crop_w}:{game_crop_h}:{game_x}:{game_y},"
-        "scale=1080:960[game];"
-        "[cam][game]vstack=inputs=2[v]"
+    # Crop gameplay from the full video height.
+    # Facecam is independently cropped from its detected box.
+    filter_complex = (
+        f"[0:v]split=2[game][cam];"
+        f"[game]crop={crop_w}:{video_height}:{crop_x}:0,"
+        f"scale=1080:960:force_original_aspect_ratio=increase,"
+        f"crop=1080:960[gameplay];"
+        f"[cam]crop={cam_w}:{cam_h}:{cam_x}:{cam_y},"
+        f"scale=1080:960:force_original_aspect_ratio=decrease,"
+        f"pad=1080:960:(ow-iw)/2:(oh-ih)/2[facecam];"
+        f"[facecam][gameplay]vstack=inputs=2[outv]"
     )
 
-    print("Rendering selected highlight...")
-    print("Timestamp:", candidate["timestamp"])
-    print(
-        "Gameplay crop:",
-        game_x,
-        game_y,
-        game_crop_w,
-        game_crop_h,
-    )
-    print("Facecam:", facecam)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     run([
         "ffmpeg",
         "-y",
-        "-ss",
-        str(start),
-        "-i",
-        str(video),
-        "-t",
-        str(CLIP_LENGTH),
-        "-filter_complex",
-        filter_graph,
-        "-map",
-        "[v]",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        str(output),
+        "-ss", str(start),
+        "-i", str(SOURCE_FILE),
+        "-t", str(CLIP_LENGTH),
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "27",
+        "-maxrate", "3500k",
+        "-bufsize", "7000k",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-movflags", "+faststart",
+        str(OUTPUT_FILE),
     ])
 
-    if not output.exists() or output.stat().st_size == 0:
-        raise RuntimeError(
-            "Vertical rendering failed."
-        )
+    if not OUTPUT_FILE.exists():
+        raise RuntimeError("FFmpeg did not create the output clip.")
 
-    print("Created:", output)
+    if OUTPUT_FILE.stat().st_size == 0:
+        raise RuntimeError("Rendered clip is empty.")
 
+
+# --------------------------------------------------
+# MAIN WORKFLOW
+# --------------------------------------------------
 
 def main():
-    if not INTERNAL_TOKEN:
-        raise RuntimeError(
-            "Internal API token is missing."
+    try:
+        print(f"Starting StreamLore job: {JOB_ID}")
+
+        update_job({
+            "status": "processing",
+            "error_message": None,
+        })
+
+        download_vod()
+
+        candidates = scan_vod()
+        highlight = select_highlight(candidates)
+
+        print(
+            "Selected highlight at "
+            f"{highlight['timestamp']}s "
+            f"with score {highlight['_score']}"
         )
 
-    if not VOD_URL:
-        raise RuntimeError(
-            "VOD URL is missing."
+        render_vertical(highlight)
+
+        storage_path = upload_clip()
+
+        reason = str(
+            highlight.get("reason", "")
+        ).strip()
+
+        description = (
+            reason[:500]
+            if reason
+            else "GTA VI highlight generated by StreamLore."
         )
 
-    video = download_vod()
+        update_job({
+            "status": "completed",
+            "clip_path": storage_path,
+            "title": "GTA VI Highlight",
+            "description": description,
+            "error_message": None,
+        })
 
-    best = rank_highlights(video)
+        print("StreamLore job completed successfully.")
 
-    print("Selected highlight:")
-    print(json.dumps(best, indent=2))
+    except Exception as exc:
+        error_message = str(exc)[:1000]
 
-    render_vertical(video, best)
+        print(f"StreamLore job failed: {error_message}")
 
-    print(
-        "STREAMLORE HIGHLIGHT PROCESSING COMPLETE"
-    )
+        try:
+            update_job({
+                "status": "failed",
+                "error_message": error_message,
+            })
+        except Exception as update_error:
+            print(
+                "Could not update failed job status: "
+                f"{str(update_error)[:300]}"
+            )
+
+        raise
 
 
 if __name__ == "__main__":
