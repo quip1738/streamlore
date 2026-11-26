@@ -1,0 +1,54 @@
+
+name: StreamLore Cloud Video Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "GTA VI livestream or VOD URL"
+        required: true
+        type: string
+
+jobs:
+  inspect-vod:
+    name: Inspect GTA VI VOD
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install video tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: Check FFmpeg
+        run: ffmpeg -version
+
+      - name: Inspect VOD
+        env:
+          VOD_URL: ${{ inputs.video_url }}
+        run: |
+          yt-dlp --dump-single-json --skip-download "$VOD_URL" > vod.json
+
+          python - <<'PY'
+          import json
+
+          with open("vod.json") as f:
+              vod = json.load(f)
+
+          print("VOD INSPECTION SUCCESS")
+          print("Title:", vod.get("title"))
+          print("Duration:", vod.get("duration"), "seconds")
+          print("Uploader:", vod.get("uploader"))
+          print("Platform:", vod.get("extractor"))
+          PY
