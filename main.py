@@ -1,604 +1,425 @@
-
 import os
-import re
+import json
 import base64
-import binascii
 import secrets
+import httpx
+
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 from urllib.parse import urlparse
 
-import httpx
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
-
-
-app = FastAPI(
-    title="StreamLore API",
-    version="0.3.0",
-)
+app = FastAPI(title="StreamLore", version="0.4.0")
 
 VISION_MODEL = os.getenv(
     "STREAMLORE_VISION_MODEL",
     "nemotron-3-nano-omni-reasoning"
 )
 
-ALLOWED_HOSTS = {
-    "twitch.tv",
-    "www.twitch.tv",
-    "youtube.com",
-    "www.youtube.com",
-    "youtu.be",
-    "m.youtube.com",
-    "kick.com",
-    "www.kick.com",
-}
+FREELLMAPI_URL = os.getenv(
+    "FREELLMAPI_URL",
+    "https://freellmapi.streamlore.prod.page/v1"
+).rstrip("/")
 
-DASHBOARD = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>StreamLore — AI Gaming Highlights</title>
-<style>
-* { box-sizing: border-box; }
+FREELLMAPI_KEY = os.getenv("FREELLMAPI_KEY", "")
+INTERNAL_TOKEN = os.getenv("STREAMLORE_INTERNAL_TOKEN", "")
 
-body {
-    margin: 0;
-    background: #090b12;
-    color: #f5f5f7;
-    font-family: Arial, sans-serif;
-    min-height: 100vh;
-}
+GITHUB_TOKEN = os.getenv("STREAMLORE_GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("STREAMLORE_GITHUB_REPO", "")
+ACCESS_CODE = os.getenv("STREAMLORE_ACCESS_CODE", "")
 
-header {
-    padding: 22px 7%;
-    border-bottom: 1px solid #242735;
-    font-size: 23px;
-    font-weight: bold;
-}
-
-header span { color: #a78bfa; }
-
-main {
-    max-width: 850px;
-    margin: 75px auto;
-    padding: 24px;
-}
-
-.tag {
-    color: #a78bfa;
-    font-size: 13px;
-    letter-spacing: 2px;
-    text-transform: uppercase;
-}
-
-h1 {
-    font-size: clamp(36px, 7vw, 55px);
-    line-height: 1.08;
-    margin: 15px 0;
-}
-
-p {
-    color: #a1a1aa;
-    line-height: 1.7;
-}
-
-.panel {
-    background: #141722;
-    border: 1px solid #292d3d;
-    border-radius: 16px;
-    padding: 25px;
-    margin-top: 30px;
-}
-
-label {
-    display: block;
-    margin: 18px 0 8px;
-    color: #d4d4d8;
-    font-size: 14px;
-}
-
-input {
-    width: 100%;
-    padding: 15px;
-    background: #090b12;
-    color: white;
-    border: 1px solid #383c4c;
-    border-radius: 9px;
-    font-size: 15px;
-}
-
-button {
-    width: 100%;
-    margin-top: 20px;
-    padding: 15px;
-    border: 0;
-    border-radius: 9px;
-    background: #8b5cf6;
-    color: white;
-    font-size: 16px;
-    font-weight: bold;
-    cursor: pointer;
-}
-
-button:disabled {
-    opacity: .5;
-    cursor: wait;
-}
-
-.status {
-    margin-top: 18px;
-    padding: 12px;
-    border-radius: 8px;
-    background: #090b12;
-    color: #c4b5fd;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
-}
-
-.features {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
-    margin-top: 25px;
-}
-
-.feature {
-    padding: 17px;
-    background: #141722;
-    border: 1px solid #292d3d;
-    border-radius: 12px;
-}
-
-.feature strong { color: #c4b5fd; }
-
-footer {
-    margin-top: 65px;
-    color: #71717a;
-    font-size: 13px;
-    text-align: center;
-}
-
-</style>
-</head>
-
-<body>
-<header>Stream<span>Lore</span></header>
-
-<main>
-    <div class="tag">AI Gaming Highlights</div>
-
-    <h1>Your stream.<br>Our intelligence.</h1>
-
-    <p>
-        Turn GTA VI livestreams into exciting vertical gaming
-        highlights. StreamLore is building an AI-powered clipping
-        platform designed to find the moments worth watching.
-    </p>
-
-    <div class="features">
-        <div class="feature">
-            <strong>AI Detection</strong>
-            <p>Find interesting moments in your VOD.</p>
-        </div>
-        <div class="feature">
-            <strong>Vertical Clips</strong>
-            <p>Streamer on top, gameplay underneath.</p>
-        </div>
-        <div class="feature">
-            <strong>Smart Captions</strong>
-            <p>Prepare clips for short-form platforms.</p>
-        </div>
-    </div>
-
-    <div class="panel">
-        <h2>Generate GTA VI Clips</h2>
-
-        <p>
-            Submit a Twitch, YouTube, or Kick VOD.
-        </p>
-
-        <form id="jobForm">
-            <label for="videoUrl">VOD URL</label>
-            <input
-                id="videoUrl"
-                type="url"
-                placeholder="https://www.twitch.tv/videos/..."
-                required
-            >
-
-            <label for="accessCode">Beta access code</label>
-            <input
-                id="accessCode"
-                type="password"
-                placeholder="Enter your access code"
-                required
-            >
-
-            <button id="submitButton" type="submit">
-                Generate Clips
-            </button>
-        </form>
-
-        <div id="status" class="status">
-            Ready to receive your VOD.
-        </div>
-    </div>
-
-    <footer>
-        StreamLore © 2026 · AI Gaming Highlights
-    </footer>
-</main>
-
-<script>
-const form = document.getElementById("jobForm");
-const button = document.getElementById("submitButton");
-const statusBox = document.getElementById("status");
-
-form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-
-    button.disabled = true;
-    button.textContent = "Submitting...";
-    statusBox.textContent = "Sending your VOD to StreamLore...";
-
-    try {
-        const response = await fetch("/api/jobs", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                video_url: document.getElementById("videoUrl").value,
-                access_code: document.getElementById("accessCode").value
-            })
-        });
-
-        const result = await response.json();
-
-        if (!response.ok) {
-            throw new Error(result.detail || "Could not submit job.");
-        }
-
-        statusBox.textContent =
-            "Job submitted successfully.\\n" +
-            "Your VOD has been sent to the cloud worker.\\n" +
-            "Job ID: " + result.job_id;
-
-        form.reset();
-
-    } catch (error) {
-        statusBox.textContent = "Error: " + error.message;
-    } finally {
-        button.disabled = false;
-        button.textContent = "Generate Clips";
-    }
-});
-</script>
-
-</body>
-</html>
-"""
+app_url = os.getenv("STREAMLORE_PUBLIC_URL", "https://streamlore.prod.page")
 
 
 class JobRequest(BaseModel):
-    video_url: str = Field(min_length=10, max_length=2048)
-    access_code: str = Field(min_length=1, max_length=256)
+    video_url: str
+    access_code: str
 
 
 class FrameRequest(BaseModel):
-    image_base64: str = Field(min_length=20, max_length=7_000_000)
+    image_base64: str
     mime_type: str = "image/jpeg"
-
-
-def check_access_code(code: str):
-    expected = os.getenv("STREAMLORE_ACCESS_CODE", "")
-
-    if not expected or not secrets.compare_digest(code, expected):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid beta access code."
-        )
-
-
-def validate_vod_url(value: str) -> str:
-    parsed = urlparse(value.strip())
-
-    if parsed.scheme != "https":
-        raise HTTPException(
-            status_code=400,
-            detail="Only HTTPS video URLs are accepted."
-        )
-
-    hostname = (parsed.hostname or "").lower()
-
-    if hostname not in ALLOWED_HOSTS:
-        raise HTTPException(
-            status_code=400,
-            detail="Only Twitch, YouTube, and Kick URLs are supported."
-        )
-
-    return value.strip()
-
-
-def get_freellmapi_url() -> str:
-    base = os.getenv("FREELLMAPI_URL", "").rstrip("/")
-
-    if not base:
-        raise HTTPException(
-            status_code=503,
-            detail="AI service URL is not configured."
-        )
-
-    if base.endswith("/v1"):
-        return base + "/chat/completions"
-
-    return base + "/v1/chat/completions"
-
-
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTMLResponse(DASHBOARD)
 
 
 @app.get("/api/health")
 async def health():
     return {
-        "app": "StreamLore",
-        "status": "healthy",
-        "github_configured": bool(
-            os.getenv("STREAMLORE_GITHUB_TOKEN")
-            and os.getenv("STREAMLORE_GITHUB_REPO")
-        ),
-        "vision_configured": bool(
-            os.getenv("FREELLMAPI_URL")
-            and os.getenv("FREELLMAPI_API_KEY")
-        ),
+        "status": "ok",
+        "service": "StreamLore",
+        "version": "0.4.0",
+        "github_configured": bool(GITHUB_TOKEN and GITHUB_REPO),
+        "vision_configured": bool(FREELLMAPI_KEY and VISION_MODEL),
+        "internal_token_configured": bool(INTERNAL_TOKEN),
     }
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>StreamLore — AI Gaming Clips</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          margin: 0;
+          min-height: 100vh;
+          background: #090b12;
+          color: #f5f5f7;
+          font-family: Arial, sans-serif;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 24px;
+        }
+        main {
+          width: 100%;
+          max-width: 620px;
+          background: #121622;
+          border: 1px solid #252c3c;
+          border-radius: 18px;
+          padding: 32px;
+        }
+        h1 { margin-top: 0; font-size: 34px; }
+        p { color: #aab2c5; line-height: 1.6; }
+        label {
+          display: block;
+          margin: 20px 0 8px;
+          color: #dce1ed;
+          font-size: 14px;
+        }
+        input {
+          width: 100%;
+          padding: 14px;
+          border-radius: 9px;
+          border: 1px solid #343d51;
+          background: #090d17;
+          color: white;
+          font-size: 15px;
+        }
+        button {
+          width: 100%;
+          margin-top: 22px;
+          padding: 15px;
+          border: 0;
+          border-radius: 9px;
+          background: #8b5cf6;
+          color: white;
+          font-weight: bold;
+          font-size: 16px;
+          cursor: pointer;
+        }
+        button:disabled { opacity: .5; cursor: wait; }
+        #result {
+          margin-top: 20px;
+          padding: 14px;
+          border-radius: 9px;
+          background: #090d17;
+          white-space: pre-wrap;
+          color: #cbd5e1;
+          display: none;
+        }
+        .tag {
+          display: inline-block;
+          padding: 6px 10px;
+          border-radius: 20px;
+          background: #211b3d;
+          color: #c4b5fd;
+          font-size: 12px;
+        }
+      </style>
+    </head>
+    <body>
+      <main>
+        <span class="tag">GTA VI CLIP GENERATOR</span>
+        <h1>StreamLore</h1>
+        <p>
+          Turn gaming VODs into vertical highlight clips.
+          Paste a Twitch, YouTube, or Kick VOD link to submit a job.
+        </p>
+
+        <form id="clipForm">
+          <label for="video">VOD URL</label>
+          <input id="video" type="url" placeholder="Paste your VOD link" required>
+
+          <label for="code">Beta access code</label>
+          <input id="code" type="password" placeholder="Enter your access code" required>
+
+          <button id="submit" type="submit">Generate Clips</button>
+        </form>
+
+        <div id="result"></div>
+      </main>
+
+      <script>
+        const form = document.getElementById("clipForm");
+        const button = document.getElementById("submit");
+        const result = document.getElementById("result");
+
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          button.disabled = true;
+          button.textContent = "Submitting...";
+          result.style.display = "block";
+          result.textContent = "Submitting your VOD to the cloud worker...";
+
+          try {
+            const response = await fetch("/api/jobs", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                video_url: document.getElementById("video").value,
+                access_code: document.getElementById("code").value
+              })
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+              throw new Error(data.detail || "Unable to submit job.");
+            }
+
+            result.textContent =
+              "Your VOD was submitted.\\nJob ID: " + data.job_id +
+              "\\n\\nThis early version does not yet provide live job tracking or a clip dashboard.";
+          } catch (error) {
+            result.textContent = "Error: " + error.message;
+          } finally {
+            button.disabled = false;
+            button.textContent = "Generate Clips";
+          }
+        });
+      </script>
+    </body>
+    </html>
+    """
 
 
 @app.post("/api/jobs")
 async def create_job(request: JobRequest):
-    check_access_code(request.access_code)
+    if not ACCESS_CODE or not secrets.compare_digest(
+        request.access_code, ACCESS_CODE
+    ):
+        raise HTTPException(status_code=401, detail="Invalid access code.")
 
-    video_url = validate_vod_url(request.video_url)
-
-    github_token = os.getenv("STREAMLORE_GITHUB_TOKEN", "")
-    repository = os.getenv(
-        "STREAMLORE_GITHUB_REPO",
-        "quip1738/streamlore"
-    )
-
-    if not github_token:
+    if not GITHUB_TOKEN or not GITHUB_REPO:
         raise HTTPException(
             status_code=503,
             detail="Cloud worker is not configured."
         )
 
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+    parsed = urlparse(request.video_url)
+    host = (parsed.hostname or "").lower()
+
+    allowed_hosts = (
+        "twitch.tv",
+        "youtube.com",
+        "youtu.be",
+        "kick.com",
+    )
+
+    if not any(host == domain or host.endswith("." + domain)
+               for domain in allowed_hosts):
         raise HTTPException(
-            status_code=500,
-            detail="Invalid GitHub repository configuration."
+            status_code=400,
+            detail="Only Twitch, YouTube, and Kick VOD links are supported."
         )
 
-    owner, repo = repository.split("/", 1)
-
-    dispatch_url = (
-        f"https://api.github.com/repos/{owner}/{repo}"
+    endpoint = (
+        f"https://api.github.com/repos/{GITHUB_REPO}"
         "/actions/workflows/streamlore-worker.yml/dispatches"
     )
 
-    payload = {
-        "ref": "main",
-        "inputs": {
-            "video_url": video_url
-        }
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                dispatch_url,
-                headers={
-                    "Accept": "application/vnd.github+json",
-                    "Authorization": f"Bearer {github_token}",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
-                json=payload,
-            )
+    payload = {
+        "ref": "main",
+        "inputs": {"video_url": request.video_url},
+    }
 
-        if response.status_code not in (200, 204):
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "GitHub could not start the cloud worker. "
-                    "Check the repository Actions permissions and workflow."
-                )
-            )
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            endpoint,
+            headers=headers,
+            json=payload,
+        )
 
-        return {
-            "status": "submitted",
-            "job_id": secrets.token_hex(8),
-            "message": "Your VOD was submitted to the StreamLore cloud worker."
-        }
-
-    except httpx.RequestError:
+    if response.status_code != 204:
         raise HTTPException(
             status_code=502,
-            detail="Could not connect to the cloud worker."
+            detail="GitHub could not start the cloud worker."
         )
+
+    return {
+        "status": "submitted",
+        "job_id": secrets.token_hex(8),
+        "message": "VOD submitted to the cloud worker.",
+    }
 
 
 @app.post("/api/internal/analyze-frame")
 async def analyze_frame(
     request: FrameRequest,
-    x_internal_token: str = Header(default="")
+    x_internal_token: str = Header(default=""),
 ):
-    expected_token = os.getenv(
-        "STREAMLORE_INTERNAL_TOKEN",
-        ""
-    )
-
-    if not expected_token or not secrets.compare_digest(
-        x_internal_token,
-        expected_token
+    if not INTERNAL_TOKEN or not secrets.compare_digest(
+        x_internal_token, INTERNAL_TOKEN
     ):
+        raise HTTPException(status_code=401, detail="Unauthorized.")
+
+    if not FREELLMAPI_KEY:
         raise HTTPException(
-            status_code=401,
-            detail="Unauthorized."
+            status_code=503,
+            detail="Vision API is not configured."
         )
 
     if request.mime_type not in (
         "image/jpeg",
         "image/png",
-        "image/webp"
+        "image/webp",
     ):
         raise HTTPException(
             status_code=400,
-            detail="Unsupported image format."
+            detail="Unsupported image type."
         )
-
-    encoded = request.image_base64.strip()
-
-    if encoded.startswith("data:"):
-        try:
-            header, encoded = encoded.split(",", 1)
-            if request.mime_type not in header:
-                raise ValueError("MIME mismatch")
-        except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid image data URL."
-            )
 
     try:
         image_bytes = base64.b64decode(
-            encoded,
-            validate=True
+            request.image_base64,
+            validate=True,
         )
-    except (binascii.Error, ValueError):
+    except Exception:
         raise HTTPException(
             status_code=400,
             detail="Invalid base64 image."
         )
 
-    if not image_bytes or len(image_bytes) > 5_000_000:
+    if not image_bytes or len(image_bytes) > 5 * 1024 * 1024:
         raise HTTPException(
-            status_code=413,
-            detail="Image must be smaller than 5 MB."
+            status_code=400,
+            detail="Image must be between 1 byte and 5 MB."
         )
 
-    api_key = os.getenv("FREELLMAPI_API_KEY", "")
-
-    if not api_key:
-        raise HTTPException(
-            status_code=503,
-            detail="Vision API key is not configured."
-        )
-
-    image_url = (
-        f"data:{request.mime_type};base64,{encoded}"
+    image_data = (
+        f"data:{request.mime_type};base64,{request.image_base64}"
     )
 
     prompt = """
-You are analyzing a frame from a GTA VI livestream.
+You are analyzing a frame from a GTA VI livestream VOD.
 
-Find the streamer's facecam/webcam overlay, if one exists.
+Return ONLY one valid JSON object. Do not use markdown or code fences.
 
-Return ONLY valid JSON with this structure:
+Evaluate BOTH:
+1. Whether a streamer facecam is visible.
+2. Whether this frame appears to show an exciting or potentially
+   engaging moment worth examining as a short-form gaming clip.
+
+Use this exact JSON structure:
 
 {
-  "facecam_detected": true,
-  "facecam_box": {
-    "x": 0.0,
-    "y": 0.0,
-    "width": 0.0,
-    "height": 0.0
-  },
-  "confidence": 0.0,
-  "description": "Brief description of the detected region"
+  "highlight_score": 0,
+  "reason": "Brief explanation of the visual moment",
+  "facecam_detected": false,
+  "facecam_box": null,
+  "facecam_confidence": 0.0,
+  "description": "Brief description of the facecam or why none is visible"
 }
 
-Coordinates must be normalized from 0 to 1 relative to the
-full image. The origin (0,0) is the top-left corner.
-
-The bounding box must cover the entire facecam overlay,
-not just the person's face.
-
-If there is no clearly identifiable facecam, return
-facecam_detected as false and facecam_box as null.
-
-Do not mistake an in-game character, portrait, mirror,
-or poster for the streamer.
+Rules:
+- highlight_score must be an integer from 0 to 10.
+- Score only what is visually supported by this single frame.
+- Do not invent action, dialogue, reactions, or events outside the frame.
+- A static menu, loading screen, starting soon screen, or ordinary
+  uneventful gameplay should receive a low score.
+- High scores should be reserved for visually clear, unusual,
+  intense, dramatic, or potentially entertaining gameplay moments.
+- facecam_detected must be true only when a real streamer webcam
+  panel is visibly present.
+- If detected, facecam_box must use normalized coordinates from
+  0 to 1, measured relative to the full image:
+  {"x":0.0,"y":0.0,"width":0.0,"height":0.0}
+- The box must tightly contain the facecam panel, not just the face.
+- If no facecam is visible, set facecam_box to null.
+- facecam_confidence must be a number from 0 to 1.
+- Do not guess a facecam location.
 """
+
+    api_url = (
+        FREELLMAPI_URL + "/chat/completions"
+        if FREELLMAPI_URL.endswith("/v1")
+        else FREELLMAPI_URL + "/v1/chat/completions"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {FREELLMAPI_KEY}",
+        "Content-Type": "application/json",
+    }
 
     payload = {
         "model": VISION_MODEL,
+        "temperature": 0.1,
+        "max_tokens": 500,
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {
-                        "type": "text",
-                        "text": prompt
-                    },
+                    {"type": "text", "text": prompt},
                     {
                         "type": "image_url",
-                        "image_url": {
-                            "url": image_url,
-                            "detail": "high"
-                        }
-                    }
-                ]
+                        "image_url": {"url": image_data},
+                    },
+                ],
             }
         ],
-        "stream": False
     }
 
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            api_url,
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail="Vision provider returned an error."
+        )
+
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                get_freellmapi_url(),
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=payload
-            )
-
-        if response.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Vision provider returned an error. "
-                    "Check the enabled vision models and provider limits."
-                )
-            )
-
         result = response.json()
         content = result["choices"][0]["message"]["content"]
 
-        return {
-            "status": "success",
-            "model": result.get("model", VISION_MODEL),
-            "analysis": content
-        }
+        if isinstance(content, list):
+            content = "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict)
+            )
 
-    except httpx.TimeoutException:
-        raise HTTPException(
-            status_code=504,
-            detail="Vision analysis timed out."
-        )
+        content = content.strip()
 
-    except httpx.RequestError:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not connect to FreeLLMAPI."
-        )
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1]
+            content = content.rsplit("```", 1)[0].strip()
 
-    except (KeyError, IndexError, TypeError, ValueError):
+        parsed_result = json.loads(content)
+
+    except Exception:
         raise HTTPException(
             status_code=502,
-            detail="Unexpected response from the vision provider."
+            detail="Vision provider returned invalid JSON."
         )
+
+    return {
+        "status": "success",
+        "model": VISION_MODEL,
+        "analysis": json.dumps(parsed_result),
+    }
