@@ -11,7 +11,7 @@ on:
 
 jobs:
   inspect-vod:
-    name: Inspect and Download GTA VI VOD
+    name: Inspect and Process GTA VI VOD
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -65,10 +65,23 @@ jobs:
             -o "streamlore-test.%(ext)s" \
             "$VOD_URL"
 
-      - name: Upload test video
+      - name: Render vertical test clip
+        run: |
+          ffmpeg -y -i streamlore-test.mp4 \
+            -vf "crop=trunc(ih*9/16/2)*2:ih,scale=1080:1920" \
+            -c:v libx264 \
+            -preset veryfast \
+            -crf 23 \
+            -c:a aac \
+            -b:a 128k \
+            streamlore-vertical-test.mp4
+
+      - name: Upload test videos
         uses: actions/upload-artifact@v4
         with:
-          name: streamlore-twitch-test
-          path: streamlore-test.mp4
+          name: streamlore-video-tests
+          path: |
+            streamlore-test.mp4
+            streamlore-vertical-test.mp4
           if-no-files-found: error
           retention-days: 1
