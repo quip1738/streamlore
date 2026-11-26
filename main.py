@@ -1,3 +1,4 @@
+
 import os
 import json
 import base64
@@ -9,7 +10,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from urllib.parse import urlparse
 
-app = FastAPI(title="StreamLore", version="0.4.0")
+app = FastAPI(title="StreamLore", version="0.5.0")
 
 VISION_MODEL = os.getenv(
     "STREAMLORE_VISION_MODEL",
@@ -28,7 +29,8 @@ GITHUB_TOKEN = os.getenv("STREAMLORE_GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("STREAMLORE_GITHUB_REPO", "")
 ACCESS_CODE = os.getenv("STREAMLORE_ACCESS_CODE", "")
 
-app_url = os.getenv("STREAMLORE_PUBLIC_URL", "https://streamlore.prod.page")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 
 class JobRequest(BaseModel):
@@ -41,15 +43,47 @@ class FrameRequest(BaseModel):
     mime_type: str = "image/jpeg"
 
 
+def supabase_headers(prefer=None):
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    if prefer:
+        headers["Prefer"] = prefer
+
+    return headers
+
+
+async def update_job(job_id, values):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase is not configured.")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/jobs",
+            params={"id": f"eq.{job_id}"},
+            headers=supabase_headers(),
+            json={
+                **values,
+                "updated_at": "now()",
+            },
+        )
+
+    response.raise_for_status()
+
+
 @app.get("/api/health")
 async def health():
     return {
         "status": "ok",
         "service": "StreamLore",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "github_configured": bool(GITHUB_TOKEN and GITHUB_REPO),
         "vision_configured": bool(FREELLMAPI_KEY and VISION_MODEL),
         "internal_token_configured": bool(INTERNAL_TOKEN),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
     }
 
 
@@ -164,7 +198,7 @@ async def home():
           button.disabled = true;
           button.textContent = "Submitting...";
           result.style.display = "block";
-          result.textContent = "Submitting your VOD to the cloud worker...";
+          result.textContent = "Submitting your VOD...";
 
           try {
             const response = await fetch("/api/jobs", {
@@ -184,7 +218,7 @@ async def home():
 
             result.textContent =
               "Your VOD was submitted.\\nJob ID: " + data.job_id +
-              "\\n\\nThis early version does not yet provide live job tracking or a clip dashboard.";
+              "\\nStatus: " + data.status;
           } catch (error) {
             result.textContent = "Error: " + error.message;
           } finally {
@@ -205,6 +239,12 @@ async def create_job(request: JobRequest):
     ):
         raise HTTPException(status_code=401, detail="Invalid access code.")
 
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase is not configured."
+        )
+
     if not GITHUB_TOKEN or not GITHUB_REPO:
         raise HTTPException(
             status_code=503,
@@ -221,13 +261,42 @@ async def create_job(request: JobRequest):
         "kick.com",
     )
 
-    if not any(host == domain or host.endswith("." + domain)
-               for domain in allowed_hosts):
+    if not any(
+        host == domain or host.endswith("." + domain)
+        for domain in allowed_hosts
+    ):
         raise HTTPException(
             status_code=400,
             detail="Only Twitch, YouTube, and Kick VOD links are supported."
         )
 
+    # Create a persistent job record first.
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            db_response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/jobs",
+                headers=supabase_headers("return=representation"),
+                json={
+                    "source_url": request.video_url,
+                    "status": "queued",
+                },
+            )
+
+        db_response.raise_for_status()
+        rows = db_response.json()
+
+        if not rows:
+            raise RuntimeError("Supabase did not return a job record.")
+
+        job_id = rows[0]["id"]
+
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not create the job in Supabase."
+        )
+
+    # Dispatch the job to GitHub Actions.
     endpoint = (
         f"https://api.github.com/repos/{GITHUB_REPO}"
         "/actions/workflows/streamlore-worker.yml/dispatches"
@@ -241,25 +310,52 @@ async def create_job(request: JobRequest):
 
     payload = {
         "ref": "main",
-        "inputs": {"video_url": request.video_url},
+        "inputs": {
+            "video_url": request.video_url,
+            "job_id": str(job_id),
+        },
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            endpoint,
-            headers=headers,
-            json=payload,
-        )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                endpoint,
+                headers=headers,
+                json=payload,
+            )
 
-    if response.status_code != 204:
+        if response.status_code != 204:
+            await update_job(
+                job_id,
+                {
+                    "status": "failed",
+                    "error_message": "GitHub could not start the worker.",
+                },
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail="GitHub could not start the cloud worker."
+            )
+
+    except HTTPException:
+        raise
+    except Exception:
+        await update_job(
+            job_id,
+            {
+                "status": "failed",
+                "error_message": "Could not dispatch the cloud worker.",
+            },
+        )
         raise HTTPException(
             status_code=502,
-            detail="GitHub could not start the cloud worker."
+            detail="Could not dispatch the cloud worker."
         )
 
     return {
-        "status": "submitted",
-        "job_id": secrets.token_hex(8),
+        "status": "queued",
+        "job_id": str(job_id),
         "message": "VOD submitted to the cloud worker.",
     }
 
